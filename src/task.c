@@ -8,7 +8,7 @@
 Task *create_task(task_type_t type, int priority, const char *p1, const char *p2) {
 
     Task *t = (Task*)malloc(sizeof(Task));
-    if (!t) returb NULL;
+    if (!t) return NULL;
 
     t->pid = -1; //sera fixé après fork
     t->priority = priority;
@@ -61,6 +61,20 @@ void print_task(const Task *t) {
         default: type_str = "Inconnu"; break;
         
     }
-    printf("Task: PID=%d | Type=%s | Etat=%s | Priorité=%d | État=%d\n",
-           t->pid, type_str, t->priority, t->state);
+    const char *state_str = "";
+    switch (t->state) {
+        case READY:      state_str = "READY"; break;
+        case RUNNING:    state_str = "RUNNING"; break;
+        case TERMINATED: state_str = "TERMINATED"; break;
+        default:         state_str = "INCONNU"; break;
+    }
+
+    printf("Task: PID=%d | Type=%s | Prio=%d | Etat=%s | Param1=\"%s\" | Param2=\"%s\"\n",
+           t->pid,
+           type_str,
+           t->priority,
+           state_str,
+           t->param1 ? t->param1 : "N/A",
+           t->param2 ? t->param2 : "N/A");
+
 }
