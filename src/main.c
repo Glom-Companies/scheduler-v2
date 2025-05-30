@@ -1,5 +1,5 @@
 #include <sys/types.h>   // pour pid_t
-#include <sys/wait.h>    // pour waitpid si besoin
+#include <sys/wait.h>    // pour waitpid
 #include <unistd.h>      // pour fork, getpid, sleep
 #include <signal.h>      // pour SIGSTOP
 #include <stdio.h>
@@ -12,17 +12,20 @@
 #include "queue.h"
 #include "scheduler.h"
 
-///// VARIABLE GLOBALE ///// 
-Queue q; // File d’attente globale protégée par un mutex
+#define LOGFILE "/tmp/scheduler.log"
 
-// Handler SIGINT (Ctrl+C) qui tue les fils restants et libère la file
+///// VARIABLE GLOBALE /////
+static Queue q;                  // File d’attente globale protégée par un mutex
+static int scheduler_running = 0; // 0 = pas d’ordonnanceur en cours, 1 = en cours
+
+// Handler SIGINT (Ctrl+C) : tue tous les fils et libère la file
 void sigint_handler(int sig) {
     (void)sig;
     printf("\n\n[INFO] Interruption (Ctrl+C) détectée. Nettoyage...\n");
 
-    // Tant que la file n'est pas vide, on défiler et on tue les fils si nécessaire
     while (!queue_is_empty(&q)) {
-        Task *t = dequeue(&q); 
+        Task *t = dequeue(&q);
+        if (!t) break;
         if (t->state != TERMINATED && t->pid > 0) {
             printf("[INFO] ➤ Suppression du fils PID=%d\n", t->pid);
             kill(t->pid, SIGKILL);
@@ -71,32 +74,36 @@ int main(void) {
         int choice = atoi(line);
 
         if (choice == 1) {
-            // --- 1. Ajouter une tâche ---
+            // --- 1. Ajouter une tâche prédéfinie ---
             printf("\n===== Menu des tâches prédéfinies =====\n");
             printf("1. Conversion vidéo -> audio\n");
             printf("2. Compression de fichier\n");
             printf("3. Mise à jour du système\n");
             printf("4. Clonage Git\n");
             printf("Votre choix (1–4) > ");
-            
+
             if (!fgets(line, sizeof(line), stdin)) continue;
             int type_choice = atoi(line);
-            if(type_choice < 1 || type_choice > 4) {
+            if (type_choice < 1 || type_choice > 4) {
                 printf("Type invalide, retour au menu principal.\n");
                 continue;
             }
-            task_type_t chosen_type = (task_type_t)(type_choice -1);
+            task_type_t chosen_type = (task_type_t)(type_choice - 1);
 
-            //Variables pour les paramètres 1 et 2
+            // Variables pour les paramètres
             char *p1 = NULL, *p2 = NULL;
 
             switch (chosen_type) {
                 case TASK_CONV_VIDEO:
+                    // Demande chemin vidéo
                     printf("Chemin du fichier vidéo à convertir : ");
-                    if (!fgets(line, sizeof(line), stdin)) break;
+                    if (!fgets(line, sizeof(line), stdin)) {
+                        break;
+                    }
                     line[strcspn(line, "\n")] = '\0';
                     p1 = strdup(line);
 
+                    // Demande chemin audio de sortie
                     printf("Chemin du fichier audio de sortie (ex: sortie.mp3) : ");
                     if (!fgets(line, sizeof(line), stdin)) {
                         free(p1);
@@ -105,28 +112,37 @@ int main(void) {
                     line[strcspn(line, "\n")] = '\0';
                     p2 = strdup(line);
                     break;
-                
+
                 case TASK_COMPRESS:
+                    // Demande chemin du fichier/dossier à compresser
                     printf("Chemin du fichier ou dossier à compresser : ");
-                    if (!fgets(line, sizeof(line), stdin)) break;
+                    if (!fgets(line, sizeof(line), stdin)) {
+                        break;
+                    }
                     line[strcspn(line, "\n")] = '\0';
                     p1 = strdup(line);
-                    //On génère une destination
+                    // Génère nom de sortie en ajoutant .zst
                     {
                         char tmp[512];
                         snprintf(tmp, sizeof(tmp), "%s.zst", p1);
                         p2 = strdup(tmp);
                     }
                     break;
+
                 case TASK_UPDATE:
-                    //Pas de paramètres
+                    // Pas de paramètres à demander
                     break;
+
                 case TASK_CLONE:
+                    // Demande URL du dépôt
                     printf("URL du dépôt Git à cloner : ");
-                    if (!fgets(line, sizeof(line), stdin)) break;
+                    if (!fgets(line, sizeof(line), stdin)) {
+                        break;
+                    }
                     line[strcspn(line, "\n")] = '\0';
                     p1 = strdup(line);
 
+                    // Demande dossier de destination
                     printf("Dossier de destination : ");
                     if (!fgets(line, sizeof(line), stdin)) {
                         free(p1);
@@ -136,39 +152,33 @@ int main(void) {
                     p2 = strdup(line);
                     break;
             }
-            
-            int prio = 0;
+
+            int prio = 0;  // priorité par défaut (modifiable si souhaité)
             Task *t = create_task(chosen_type, prio, p1, p2);
             if (p1) free(p1);
             if (p2) free(p2);
-            if(!t) {
-                fprintf(stderr, "Échec création de la tâche.\n");
+            if (!t) {
+                fprintf(stderr, "[Erreur] Échec création de la tâche.\n");
                 continue;
             }
 
-            
-            // Fork pour créer le processus fils + SIGSTOP + enqueue
+            // Fork + SIGSTOP + enqueue
             pid_t pid = fork();
             if (pid < 0) {
-                perror("fork échoué");
+                perror("[Erreur] fork échoué");
                 free_task(t);
-                continue; 
+                continue;
             }
-
             if (pid == 0) {
-                // ---- Code exécuté DANS LE FILS ----
-                signal(SIGINT, SIG_IGN);   // Ignorer Ctrl+C dans le fils
-
-                // Exécuter la tâche (multithreadée)
+                // ==== Code exécuté DANS LE FILS ====
+                signal(SIGINT, SIG_IGN); // Ignorer Ctrl+C dans le fils
                 execute_task(t);
-
-                _exit(0); // Terminer le fils proprement
+                _exit(0);
             } else {
-                // ---- Code exécuté DANS LE PARENT ----
+                // ==== Code exécuté DANS LE PARENT ====
                 t->pid = pid;
                 t->state = READY;
-
-                // Stopper le fils immédiatement (pour contrôle via SIGCONT dans le scheduler)
+                // Stopper le fils immédiatement
                 kill(pid, SIGSTOP);
 
                 // Enfiler la tâche (FIFO ou PRIORITY)
@@ -177,9 +187,7 @@ int main(void) {
                 } else {
                     enqueue(&q, t);
                 }
-
-                printf("Tâche ajoutée (fork & STOP) : type=%d, PID=%d\n",
-                    chosen_type, pid);
+                printf("[Info] Tâche ajoutée : Type=%d, PID=%d\n", chosen_type, pid);
             }
 
         } else if (choice == 2) {
@@ -188,7 +196,7 @@ int main(void) {
 
         } else if (choice == 3) {
             // --- 3. Choisir l'algorithme ---
-            printf("Choisir algorithme: 0=FIFO, 1=RR, 2=PRIORITY : ");
+            printf("Choisir algorithme : 0=FIFO, 1=RR, 2=PRIORITY > ");
             if (!fgets(line, sizeof(line), stdin)) continue;
             int a = atoi(line);
             if (a >= 0 && a <= 2) {
@@ -209,16 +217,42 @@ int main(void) {
             if (queue_is_empty(&q)) {
                 printf("La file est vide, rien à ordonnancer.\n");
             } else {
-                printf("Ordonnancement en cours avec algorithme = %d (dans un thread)\n",
-                    current_algo);
-                if (start_scheduler_thread(current_algo, &q, quantum) == -1) {
-                    printf("[ERREUR] Impossible de démarrer l’ordonnanceur.\n");
+                if (scheduler_running) {
+                    printf("Un ordonnanceur est déjà en cours d'exécution.\n");
                 } else {
-                    printf("Appuyez sur Entrée pour revenir au menu...\n");
-                    char wait[4];
-                    if (fgets(wait, sizeof(wait), stdin) == NULL) {
-                        perror("Erreur de lecture avec fgets");
-                        // Gérer l'erreur si nécessaire
+                    // 1) Vider le fichier de log
+                    FILE *f = fopen(LOGFILE, "w");
+                    if (f) {
+                        fclose(f);
+                    } else {
+                        perror("[Erreur] Ouverture fichier log");
+                    }
+
+                    // 2) Lancer xterm (ou gnome-terminal) pour suivre le log
+                    pid_t child = fork();
+                    if (child < 0) {
+                        perror("[Erreur] fork pour xterm");
+                    } else if (child == 0) {
+                        // Dans l'enfant : lance xterm et tail le log
+                        execlp("xterm", "xterm",
+                               "-T", "Watcher Ordonnanceur",
+                               "-e", "bash -c \"tail -f /tmp/scheduler.log; echo 'Fin du log. Appuyez sur Entrée pour fermer.'; read\"",
+                               (char *)NULL);
+                        perror("[Erreur] execlp xterm");
+                        _exit(EXIT_FAILURE);
+                    } else {
+                        // Dans le parent, on laisse xterm s'ouvrir
+                        printf("[Info] Fenêtre de log ouverte (PID=%d)\n", child);
+                    }
+
+                    // 3) Démarrer le scheduler dans un thread
+                    scheduler_running = 1;
+                    if (start_scheduler_thread(current_algo, &q, quantum) == -1) {
+                        printf("[ERREUR] Impossible de démarrer l’ordonnanceur.\n");
+                        scheduler_running = 0;
+                    } else {
+                        printf("[Info] Ordonnancement lancé (logs dans fenêtre dédiée).\n");
+                        printf("[Info] Retour au menu principal.\n");
                     }
                 }
             }
@@ -235,10 +269,10 @@ int main(void) {
         }
     }
 
-    // Nettoyage final (lorsque l'utilisateur choisit 5 ou EOF)
+    // Nettoyage final (si on arrive ici)
     while (!queue_is_empty(&q)) {
         Task *t = dequeue(&q);
-        // Si un fils est toujours en attente, on le tue
+        if (!t) break;
         if (t->state != TERMINATED && t->pid > 0) {
             kill(t->pid, SIGKILL);
         }

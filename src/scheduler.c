@@ -2,6 +2,7 @@
 #include "scheduler.h"
 #include "task.h"
 #include "queue.h"
+
 #include <sys/wait.h>
 #include <signal.h>     // kill, SIGCONT, SIGSTOP, SIGALRM
 #include <stdio.h>
@@ -9,78 +10,117 @@
 #include <string.h>
 #include <pthread.h>
 #include <sys/time.h>   // setitimer
-#include <unistd.h>     // pause()
+#include <unistd.h>     // pause(), usleep
+#include <stdarg.h>     // va_list, va_start, va_end
+#include <fcntl.h>      // open
+#include <errno.h>
 
-//flag pour indiquer fin du quantum
+#define LOGFILE "/tmp/scheduler.log"
+
+// flag pour indiquer fin du quantum
 static volatile sig_atomic_t alarm_flag = 0;
 
-//handler pour SIGALRM (la préemption)
+// Handler pour SIGALRM (préemption)
 static void sigalrm_handler(int sig) {
     (void)sig;
-    alarm_flag = 1; //indique temps écoulé
+    alarm_flag = 1; // indique que le quantum est écoulé
 }
 
-//Fonction FIFO
+// Fonction utilitaire : écrit un message formaté dans le fichier de log
+static void log_msg(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    FILE *f = fopen(LOGFILE, "a");
+    if (!f) {
+        va_end(args);
+        return;
+    }
+    vfprintf(f, format, args);
+    fprintf(f, "\n");
+    fclose(f);
+    va_end(args);
+}
+
+// Aide pour afficher le type de tâche en texte
+static const char *get_task_type_str(task_type_t type) {
+    switch (type) {
+        case TASK_CONV_VIDEO: return "Conversion";
+        case TASK_COMPRESS:   return "Compression";
+        case TASK_UPDATE:     return "MiseAJour";
+        case TASK_CLONE:      return "ClonageGit";
+        default:              return "Inconnu";
+    }
+}
+
+// ========== Fonction FIFO ==========
 
 static void run_fifo(Queue *q) {
     while (!queue_is_empty(q)) {
-        Task *t = dequeue(q); //on récupère la tête de la file first in first out
+        Task *t = dequeue(q);
+        if (!t) break;
+
         pid_t pid = t->pid;
         t->state = RUNNING;
-        printf("[FIFO] Reprise du fils pid=%d (\"%s\")\n", pid, t->description);
-        
+        // Log de début d'exécution
+        log_msg("[FIFO] Reprise du fils pid=%d (Type=%s, Param1=\"%s\")",
+                pid, get_task_type_str(t->type),
+                t->param1 ? t->param1 : "N/A");
 
-        //a- Réveil du fils endormi avec SIGCONT
-        if(kill(pid, SIGCONT) == -1) {
-            perror("kill SIGCONT");
-            //nettoyage même si erreur
+        // Réveil du fils
+        if (kill(pid, SIGCONT) == -1) {
+            log_msg("[FIFO][ERREUR] kill SIGCONT pid=%d : %s", pid, strerror(errno));
         }
-        //b- attendre la fin du fils en bloquant
+
+        // Attendre la fin du fils (bloquant)
         int status;
-        if(waitpid(pid, &status, 0) == -1) {
-            perror("waitpid");
+        if (waitpid(pid, &status, 0) == -1) {
+            log_msg("[FIFO][ERREUR] waitpid pid=%d : %s", pid, strerror(errno));
         } else {
             if (WIFEXITED(status)) {
-                printf("[FIFO] Tâche pid=%d terminée (exit code = %d)\n", pid, WEXITSTATUS(status));
-            } else if ( WIFSIGNALED(status)) {
-                printf("[FIFO] Tâche pid=%d tuée par signal %d\n", pid, WTERMSIG(status));
-
+                log_msg("[FIFO] Tâche pid=%d terminée (exit code=%d)",
+                        pid, WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                log_msg("[FIFO] Tâche pid=%d tuée par signal %d",
+                        pid, WTERMSIG(status));
             }
         }
 
-        //c- marquer comme TERMINATED
         t->state = TERMINATED;
         free_task(t);
     }
-
+    log_msg("[INFO] FIFO terminé.");
 }
 
-// Fonction Round Robin
+// ========== Fonction Round Robin (RR) ==========
+
 static void run_rr(Queue *q, int quantum) {
+    // Installer le handler SIGALRM
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigalrm_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     if (sigaction(SIGALRM, &sa, NULL) == -1) {
-        perror("sigaction SIGALRM");
+        log_msg("[RR][ERREUR] sigaction SIGALRM : %s", strerror(errno));
         exit(EXIT_FAILURE);
     }
-    
-    while(!queue_is_empty(q)) {
-        //1-recuperation tete de file
+
+    while (!queue_is_empty(q)) {
         Task *t = dequeue(q);
+        if (!t) break;
+
         pid_t pid = t->pid;
         t->state = RUNNING;
-        printf("[RR] Reprise du fils pid=%d (\"%s\")\n", pid, t->description);
+        log_msg("[RR] Reprise du fils pid=%d (Type=%s, Param1=\"%s\")",
+                pid, get_task_type_str(t->type),
+                t->param1 ? t->param1 : "N/A");
 
-        //2- reveil fils
-        if(kill(pid, SIGCONT) == -1) {
-            perror("kill SIGCONT");
-            //O, passe à la suite même en cas de dohiir
+        // Réveil du fils
+        if (kill(pid, SIGCONT) == -1) {
+            log_msg("[RR][ERREUR] kill SIGCONT pid=%d : %s", pid, strerror(errno));
         }
 
-        //3-installation alarme pour quantum
+        // Mettre en place le timer pour le quantum
         alarm_flag = 0;
         struct itimerval timer;
         timer.it_value.tv_sec = quantum;
@@ -88,74 +128,72 @@ static void run_rr(Queue *q, int quantum) {
         timer.it_interval.tv_sec = 0;
         timer.it_interval.tv_usec = 0;
         if (setitimer(ITIMER_REAL, &timer, NULL) == -1) {
-            perror("setitimer");
-            // Si impossible, on attend jusqu'à la fin du fils
+            log_msg("[RR][ERREUR] setitimer : %s", strerror(errno));
         }
 
-        //4- boucler jusqu'a la fin de la tach ou de l'alame
+        // Boucle jusqu’à la fin du fils ou expiration du quantum
         int status;
-        pid_t wpid;
         while (1) {
-            // a) tester si le fils déja fini (WNOHANG)
-            wpid = waitpid(pid, &status, WNOHANG);
+            // Tester si le fils a déjà fini (WNOHANG)
+            pid_t wpid = waitpid(pid, &status, WNOHANG);
             if (wpid == -1) {
-                perror("waitpid");
+                log_msg("[RR][ERREUR] waitpid pid=%d : %s", pid, strerror(errno));
                 break;
             }
             if (wpid == pid) {
-                //fils terminé avant quantum
+                // Le fils s’est terminé avant la fin du quantum
                 if (WIFEXITED(status)) {
-                    printf("[RR] Tâche pid=%d terminée (exit code = %d)\n", pid, WEXITSTATUS(status));
+                    log_msg("[RR] Tâche pid=%d terminée (exit code=%d)",
+                            pid, WEXITSTATUS(status));
                 } else if (WIFSIGNALED(status)) {
-                    printf("[RR] Tâche pid=%d tuée par signal %d\n", pid, WTERMSIG(status));
+                    log_msg("[RR] Tâche pid=%d tuée par signal %d",
+                            pid, WTERMSIG(status));
                 }
                 t->state = TERMINATED;
-                free_task(t);
-                //Annuler l'alarme restante
+                // Annuler l’alarme restante
                 timer.it_value.tv_sec = 0;
                 timer.it_value.tv_usec = 0;
                 setitimer(ITIMER_REAL, &timer, NULL);
+                free_task(t);
                 break;
             }
-            // b) Si quantum déja expiré (alarm_falg == 1)
+            // Si le quantum est écoulé
             if (alarm_flag) {
-                //Preempter la tâche
+                // Préempter le fils
                 if (kill(pid, SIGSTOP) == -1) {
-                    perror("kill SIGSTOP (préemption)");
+                    log_msg("[RR][ERREUR] kill SIGSTOP pid=%d : %s", pid, strerror(errno));
                 } else {
-                    printf("[RR] Quantum écoulé pour pid=%d, préemption.\n", pid);
+                    log_msg("[RR] Quantum écoulé pour pid=%d, préemption", pid);
                 }
                 t->state = READY;
-                //Annuler l'alarme
+                // Annuler l’alarme
                 timer.it_value.tv_sec = 0;
                 timer.it_value.tv_usec = 0;
                 setitimer(ITIMER_REAL, &timer, NULL);
-                //réenfiler en fin de file
+                // Réenfiler en fin de file
                 enqueue(q, t);
                 break;
             }
-            //c) faire une petite pause pour éviter les boucles serrées
+            // Petite pause pour éviter une boucle trop serrée
             usleep(10000);
         }
     }
-    printf("[INFO] Round Robin terminé. Revenez au menu.\n");
-    fflush(stdout);
-
+    log_msg("[INFO] Round Robin terminé.");
 }
 
-//Fonction Ordonnancement par priorité
-static void run_priority(Queue *q) {
-    while(!queue_is_empty(q)) {
-        pthread_mutex_lock(&q->mutex);
-        // 1- Chercher la tâche a priorité max
-        Task *prev_max = NULL; //pointeur vers le prédecesseur
-        Task *max_task = q->head; //on suppose temporarily que la head est la max
-        Task *prev = q->head; //pointeur pour itérer
-        Task *cursor = q->head->next; //on commence à la deuxième
+// ========== Fonction Ordonnancement par priorité ==========
 
-        //parcours pour trouver max priority
+static void run_priority(Queue *q) {
+    while (!queue_is_empty(q)) {
+        pthread_mutex_lock(&q->mutex);
+        // 1) Chercher la tâche à priorité max dans la liste chaînée
+        Task *prev_max = NULL;
+        Task *max_task = q->head;
+        Task *prev = q->head;
+        Task *cursor = q->head ? q->head->next : NULL;
+
         while (cursor != NULL) {
-            if(cursor->priority > max_task->priority) {
+            if (cursor->priority > max_task->priority) {
                 max_task = cursor;
                 prev_max = prev;
             }
@@ -163,19 +201,21 @@ static void run_priority(Queue *q) {
             cursor = cursor->next;
         }
 
-        //2- Retirer max_task de la liste chainée
+        // 2) Retirer max_task de la liste
+        if (!max_task) {
+            pthread_mutex_unlock(&q->mutex);
+            break;
+        }
         if (prev_max == NULL) {
-            //max_task est la tête
+            // max_task est la tête
             q->head = max_task->next;
             if (q->head == NULL) {
-                //file devient vide
                 q->tail = NULL;
             }
         } else {
-            //max_task est en milieu (ou queue)
+            // max_task est au milieu ou en queue
             prev_max->next = max_task->next;
             if (prev_max->next == NULL) {
-                //on aretiré l'ancienne queue
                 q->tail = prev_max;
             }
         }
@@ -183,71 +223,66 @@ static void run_priority(Queue *q) {
         q->size--;
         pthread_mutex_unlock(&q->mutex);
 
-        //3- executer la tâche sélectionnée (max_task) jusqu'à la fin
+        // 3) Exécuter la tâche sélectionnée jusqu’à la fin
         pid_t pid = max_task->pid;
         max_task->state = RUNNING;
-        printf("[PR] Reprise du fils pid=%d (\"%s\") – priorité %d\n", pid, max_task->description, max_task->priority);
+        log_msg("[PR] Reprise du fils pid=%d (Type=%s, Param1=\"%s\") – priorité=%d",
+                pid,
+                get_task_type_str(max_task->type),
+                max_task->param1 ? max_task->param1 : "N/A",
+                max_task->priority);
 
-        //reveil du fils
+        // Réveil du fils
         if (kill(pid, SIGCONT) == -1) {
-            perror("kill SIGCONT (priority)");
+            log_msg("[PR][ERREUR] kill SIGCONT pid=%d : %s", pid, strerror(errno));
         }
 
-        //Attendre la fin du fils (bloquantd)
+        // Attendre la fin du fils
         int status;
         if (waitpid(pid, &status, 0) == -1) {
-            perror("waitpid (priority)");
+            log_msg("[PR][ERREUR] waitpid pid=%d : %s", pid, strerror(errno));
         } else {
             if (WIFEXITED(status)) {
-                printf("[PR] Tâche pid=%d terminée (exit code = %d)\n", pid, WEXITSTATUS(status));
+                log_msg("[PR] Tâche pid=%d terminée (exit code=%d)",
+                        pid, WEXITSTATUS(status));
             } else if (WIFSIGNALED(status)) {
-                printf("[PR] Tâche pid=%d tuée par signal %d\n", pid, WTERMSIG(status));
+                log_msg("[PR] Tâche pid=%d tuée par signal %d",
+                        pid, WTERMSIG(status));
             }
         }
-        // 4) Libérer l'objet max_task
+
+        // 4) Libérer la tâche
         max_task->state = TERMINATED;
         free_task(max_task);
     }
-    printf("[INFO] Ordonnancement PRIORITY terminé. Revenez au menu.\n");
-    fflush(stdout);
+    log_msg("[INFO] PRIORITY terminé.");
 }
 
-// Choix d'Ordonnanceur
+// ========== run_scheduler et démarrage dans un thread ==========
+
 void run_scheduler(algo_t alg, Queue *q, int quantum) {
-    if (alg == 0) {
-        printf("[Scheduler] Algorithme reçu : FIFO\n");
-    } else if (alg == 1) {
-        printf("[Scheduler] Algorithme reçu : Round Robin RR\n");
+    if (alg == ALG_FIFO) {
+        log_msg("[Scheduler] Algorithme : FIFO");
+        run_fifo(q);
+    } else if (alg == ALG_RR) {
+        log_msg("[Scheduler] Algorithme : Round Robin");
+        run_rr(q, quantum);
+    } else if (alg == ALG_PRIORITY) {
+        log_msg("[Scheduler] Algorithme : Priority");
+        run_priority(q);
     } else {
-        printf("[Scheduler] Algorithme reçu : Priority\n");
+        log_msg("[Scheduler] Algorithme inconnu : %d", alg);
     }
-    
-    (void)quantum;
-    switch (alg) {
-        case 0:
-            run_fifo(q);
-            break;
-        case 1:
-            run_rr(q, quantum);
-            break;
-        case 2:
-            run_priority(q);
-            break;
-        default:
-        printf("[Scheduler] Algorithme inconnu.\n");
-    }
-    printf("[INFO] Ordonnancement terminé. Appuyez sur Entrée pour revenir au menu.\n");
-    fflush(stdout);
+    log_msg("[INFO] Ordonnancement terminé.");
 }
 
-//thread wrapper
 typedef struct {
     algo_t alg;
     Queue *q;
     int quantum;
 } SchedulerArg;
 
-//fonction exécuté par le thread
+// Fonction exécutée dans le thread
 void *scheduler_thread_func(void *arg) {
     SchedulerArg *sarg = (SchedulerArg *)arg;
     run_scheduler(sarg->alg, sarg->q, sarg->quantum);
@@ -255,11 +290,11 @@ void *scheduler_thread_func(void *arg) {
     return NULL;
 }
 
-//demarre un thread qui exécute un run_scheduler
+// Démarre un thread pour exécuter run_scheduler
 int start_scheduler_thread(algo_t alg, Queue *q, int quantum) {
     pthread_t tid;
     SchedulerArg *sarg = malloc(sizeof(SchedulerArg));
-    if(!sarg){
+    if (!sarg) {
         perror("malloc SchedulerArg");
         return -1;
     }
@@ -269,11 +304,10 @@ int start_scheduler_thread(algo_t alg, Queue *q, int quantum) {
 
     int res = pthread_create(&tid, NULL, scheduler_thread_func, sarg);
     if (res != 0) {
-        fprintf(stderr, "Erreur pthread_create: %s\n", strerror(res));
+        fprintf(stderr, "[Scheduler][ERREUR] pthread_create : %s\n", strerror(res));
         free(sarg);
         return -1;
     }
-    //detacher le thread pour exec independante
     pthread_detach(tid);
     return 0;
 }

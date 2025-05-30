@@ -1,7 +1,7 @@
-# Minimal makefile for Scheduler Project
+# The makefile for Scheduler Project
 
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c99 -O2 -pthread
+CFLAGS = -Wall -Wextra -std=c99 -O2 -D_POSIX_C_SOURCE=200809L -pthread
 LDFLAGS = -pthread
 
 # .c files list
