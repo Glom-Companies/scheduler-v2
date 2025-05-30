@@ -72,19 +72,82 @@ int main(void) {
 
         if (choice == 1) {
             // --- 1. Ajouter une tâche ---
-            printf("Entrez la description de la tâche : ");
-            char desc[256];
-            if (!fgets(desc, sizeof(desc), stdin)) continue;
-            desc[strcspn(desc, "\n")] = '\0';
-
-            printf("Entrez priorité (entier) : ");
+            printf("\n===== Menu des tâches prédéfinies =====\n");
+            printf("1. Conversion vidéo -> audio\n");
+            printf("2. Compression de fichier\n");
+            printf("3. Mise à jour du système\n");
+            printf("4. Clonage Git\n");
+            printf("Votre choix (1–4) > ");
+            
             if (!fgets(line, sizeof(line), stdin)) continue;
-            int prio = atoi(line);
+            int type_choice = atoi(line);
+            if(type_choice < 1 || type_choice > 4) {
+                printf("Type invalide, retour au menu principal.\n");
+                continue;
+            }
+            task_type_t chosen_type = (task_type_t)(type_choice -1);
 
-            // Créer l'objet Task
-            Task *t = create_task(prio, desc);
+            //Variables pour les paramètres 1 et 2
+            char *p1 = NULL, *p2 = NULL;
 
-            // Fork pour créer le processus fils
+            switch (chosen_type) {
+                case TASK_CONV_VIDEO:
+                    printf("Chemin du fichier vidéo à convertir : ");
+                    if (!fgets(line, sizeof(line), stdin)) break;
+                    line[strcspn(line, "\n")] = '\0';
+                    p1 = strdup(line);
+
+                    printf("Chemin du fichier audio de sortie (ex: sortie.mp3) : ");
+                    if (!fgets(line, sizeof(line), stdin)) {
+                        free(p1);
+                        break;
+                    }
+                    line[strcspn(line, "\n")] = '\0';
+                    p2 = strdup(line);
+                    break;
+                
+                case TASK_COMPRESS:
+                    printf("Chemin du fichier ou dossier à compresser : ");
+                    if (!fgets(line, sizeof(line), stdin)) break;
+                    line[strcspn(line, "\n")] = '\0';
+                    p1 = strdup(line);
+                    //On génère une destination
+                    {
+                        char tmp[512];
+                        snprintf(tmp, sizeof(tmp), "%s.zst", p1);
+                        p2 = strdup(tmp);
+                    }
+                    break;
+                case TASK_UPDATE:
+                    //Pas de paramètres
+                    break;
+                case TASK_CLONE:
+                    printf("URL du dépôt Git à cloner : ");
+                    if (!fgets(line, sizeof(line), stdin)) break;
+                    line[strcspn(line, "\n")] = '\0';
+                    p1 = strdup(line);
+
+                    printf("Dossier de destination : ");
+                    if (!fgets(line, sizeof(line), stdin)) {
+                        free(p1);
+                        break;
+                    }
+                    line[strcspn(line, "\n")] = '\0';
+                    p2 = strdup(line);
+                    break;
+            }
+            
+            int prio = 0;
+            Task *t = create_task(chosen_type, prio, p1, p2);
+            if (p1) free(p1);
+            if (p2) free(p2);
+            if(!t) {
+                fprintf(stderr, "Échec création de la tâche.\n");
+                continue;
+            }
+
+            
+            // Fork pour créer le processus fils + SIGSTOP + enqueue
             pid_t pid = fork();
             if (pid < 0) {
                 perror("fork échoué");
@@ -97,7 +160,7 @@ int main(void) {
                 signal(SIGINT, SIG_IGN);   // Ignorer Ctrl+C dans le fils
 
                 // Exécuter la tâche (multithreadée)
-                dummy_task(desc);
+                execute_task(t);
 
                 _exit(0); // Terminer le fils proprement
             } else {
@@ -115,8 +178,8 @@ int main(void) {
                     enqueue(&q, t);
                 }
 
-                printf("Tâche ajoutée (fork & STOP) : \"%s\" (prio=%d, pid=%d)\n",
-                       desc, prio, pid);
+                printf("Tâche ajoutée (fork & STOP) : type=%d, PID=%d\n",
+                    chosen_type, pid);
             }
 
         } else if (choice == 2) {
