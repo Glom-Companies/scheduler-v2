@@ -1,6 +1,6 @@
 # Projet : Ordonnanceur de Tâches avec Processus & Threads en C
 
-**Auteur :** Livingstone  
+**Auteur :** IFRI-SEIoT2/Groupe No XX
 **Date :** Mai 2025
 
 ---
