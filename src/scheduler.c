@@ -26,7 +26,7 @@ static void sigalrm_handler(int sig) {
     alarm_flag = 1; // indique que le quantum est écoulé
 }
 
-// Fonction utilitaire : écrit un message formaté dans le fichier de log
+// Fonction utilitaire : écrit un message cool formaté dans le fichier de log
 static void log_msg(const char *format, ...) {
     va_list args;
     va_start(args, format);
@@ -52,7 +52,7 @@ static const char *get_task_type_str(task_type_t type) {
     }
 }
 
-// ========== Fonction FIFO ==========
+// == Fonction FIFO ====
 
 static void run_fifo(Queue *q) {
     while (!queue_is_empty(q)) {
@@ -91,7 +91,7 @@ static void run_fifo(Queue *q) {
     log_msg("[INFO] FIFO terminé.");
 }
 
-// ========== Fonction Round Robin (RR) ==========
+// ==== Fonction Round Robin (RR)==
 
 static void run_rr(Queue *q, int quantum) {
     // Installer le handler SIGALRM
@@ -110,6 +110,37 @@ static void run_rr(Queue *q, int quantum) {
         if (!t) break;
 
         pid_t pid = t->pid;
+
+        //Si c'est une tâche UPDATE ou CLONE, on ne fait pas la préempte pas
+        if  (t->type == TASK_UPDATE || t->type == TASK_CLONE) {
+            t->state = RUNNING;
+            log_msg("[RR-NoPreemption] Lancement sans préemption pid=%d (Type=%s, Param1=\"%s\")",
+                    pid, get_task_type_str(t->type),
+                    t->param1 ? t->param1 : "N/A");
+            // Réveil du fils
+            if (kill(pid, SIGCONT) == -1) {
+                log_msg("[RR-NoPreemption][ERREUR] kill SIGCONT pid=%d : %s", pid, strerror(errno));
+            }
+            // Attendre la fin normalement (pas de timer)
+            int status;
+            if (waitpid(pid, &status, 0) == -1) {
+                log_msg("[RR-NoPreemption][ERREUR] waitpid pid=%d : %s", pid, strerror(errno));
+            } else {
+                if (WIFEXITED(status)) {
+                    log_msg("[RR-NoPreemption] Tâche pid=%d terminée (exit code=%d)",
+                            pid, WEXITSTATUS(status));
+                } else if (WIFSIGNALED(status)) {
+                    log_msg("[RR-NoPreemption] Tâche pid=%d tuée par signal %d",
+                            pid, WTERMSIG(status));
+                }
+            }
+
+            t->state = TERMINATED;
+            free_task(t);
+            continue;
+        }
+
+        //Sinon, le mode RR normal
         t->state = RUNNING;
         log_msg("[RR] Reprise du fils pid=%d (Type=%s, Param1=\"%s\")",
                 pid, get_task_type_str(t->type),
@@ -174,14 +205,14 @@ static void run_rr(Queue *q, int quantum) {
                 enqueue(q, t);
                 break;
             }
-            // Petite pause pour éviter une boucle trop serrée
+            // Petite pause pour éviter une boucle trop trop top serrée
             usleep(10000);
         }
     }
     log_msg("[INFO] Round Robin terminé.");
 }
 
-// ========== Fonction Ordonnancement par priorité ==========
+// ==== Fonction Ordonnancement par priorité =
 
 static void run_priority(Queue *q) {
     while (!queue_is_empty(q)) {
@@ -258,7 +289,7 @@ static void run_priority(Queue *q) {
     log_msg("[INFO] PRIORITY terminé.");
 }
 
-// ========== run_scheduler et démarrage dans un thread ==========
+// ==== run_scheduler et démarrage dans un thread ==================
 
 void run_scheduler(algo_t alg, Queue *q, int quantum) {
     if (alg == ALG_FIFO) {

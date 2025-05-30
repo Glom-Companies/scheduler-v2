@@ -14,8 +14,8 @@
 
 #define LOGFILE "/tmp/scheduler.log"
 
-///// VARIABLE GLOBALE /////
-static Queue q;                  // File d’attente globale protégée par un mutex
+/// VARIABLE GLOBALE /////////
+static Queue q;                  // File d’attente globale que nous protégeons par un mutex
 static int scheduler_running = 0; // 0 = pas d’ordonnanceur en cours, 1 = en cours
 
 // Handler SIGINT (Ctrl+C) : tue tous les fils et libère la file
@@ -47,6 +47,18 @@ int main(void) {
     // 3) Algorithme par défaut = FIFO
     algo_t current_algo = ALG_FIFO;
     int quantum = 2; // quantum de 2 secondes pour RR
+
+    printf("Assurez vous que les commandes suivantes sont installées :\n");
+    printf("- ffmpeg (pour conversion vidéo)\n");
+    printf("- zstd (pour compression de fichiers)\n");
+    printf("- git (pour clonage de dépôt)\n");
+    printf("Tapez la commande suivante pour installer les dépendances :\n");
+    printf("sudo apt update\n");
+    printf("sudo apt install build-essential git zstd libzstd-dev ffmpeg xterm\n");
+    printf("Appuyez sur Entrée pour continuer...\n");
+    getchar(); // Attendre l'appui sur Entrée
+    printf("Bienvenue dans l'ordonnanceur de tâches !\n");
+    printf("Vous pouvez ajouter des tâches prédéfinies, choisir l'algorithme d'ordonnancement et lancer l'ordonnanceur.\n");
 
     // 4) Boucle principale du menu
     while (1) {
@@ -153,12 +165,20 @@ int main(void) {
                     break;
             }
 
-            int prio = 0;  // priorité par défaut (modifiable si souhaité)
+            // Demander la priorité (pour l’algorithme PRIORITY)
+            printf("Entrez la priorité (entier; plus grand = plus prioritaire) : ");
+            if (!fgets(line, sizeof(line), stdin)) {
+                if (p1) free(p1);
+                if (p2) free(p2);
+                continue;
+            }
+            int prio = atoi(line);
+
             Task *t = create_task(chosen_type, prio, p1, p2);
             if (p1) free(p1);
             if (p2) free(p2);
             if (!t) {
-                fprintf(stderr, "[Erreur] Échec création de la tâche.\n");
+                fprintf(stderr, "[Erreur] Impossible de créer la tâche.n");
                 continue;
             }
 
@@ -170,7 +190,7 @@ int main(void) {
                 continue;
             }
             if (pid == 0) {
-                // ==== Code exécuté DANS LE FILS ====
+                // === Code exécuté DANS LE FILS ====
                 signal(SIGINT, SIG_IGN); // Ignorer Ctrl+C dans le fils
                 execute_task(t);
                 _exit(0);
