@@ -1,54 +1,78 @@
 #define _POSIX_C_SOURCE 200809L
+#include "tasks_impl.h"
+#include "task.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <pthread.h>
-#include "tasks_impl.h"
+//#include <pthread.h>
 
-//structure passée a chaque thread pour simuker le travail
-typedef struct {
-    int thread_id;
-    char desc[256];
-} ThreadArg;
+//Fonction de compression
+static void task_compress(Task *t) {
 
-//fonction exécuté par chaque thread
-void *thread_work(void *arg) {
-    ThreadArg *targ = (ThreadArg *)arg;
-    printf("[Fils %d][Thread %d] Début du travail pour \"%s\"\n", getpid(), targ->thread_id, targ->desc);
-    fflush(stdout);
-    sleep(1);
-    printf("[Fils %d][Thread %d] Fin du travail pour \"%s\"\n", getpid(), targ->thread_id, targ->desc);
-    fflush(stdout);
-    free(targ);
-    return NULL;
+    //t->param1 = chemin entrée, t->param2= chemin de sortie (finit par zst)
+    printf("[FIls %d] Compression %s -> %s\n", getpid(), t->param1, t->param2);
+    //Avec execlp on remplace le process par zstd :
+    int nbThreads = 1;
+    int niveau = 3;
+    //Récupérable depuis t->priority
+    char strThreads[16], strNiveau[16];
+    snprintf(strThreads, sizeof(strThreads),"-T%d", nbThreads);
+    snprintf(strNiveau, sizeof(strNiveau), "-%d", niveau);
+
+    execlp("zstd", "zstd", strThreads, strNiveau, t->param1, "-o", t->param2, (char *)NULL);
+    perror("execlp zstd");
+    _exit(EXIT_FAILURE);
 }
 
-//fonction provisoire exécutée par le fils
-void dummy_task(const char *desc) {
-    printf("[Fils %d] Démarrage tâche : %s\n", getpid(), desc);
-    fflush(stdout);
-    const int NUM_THREADS = 2;
-    pthread_t threads[NUM_THREADS];
+//Fonction conversion vidéo->audio
+static void task_convert(Task *t) {
+    printf("[Fils %d] Conversion %s → %s\n", getpid(), t->param1, t->param2);
 
-    for (int i = 0; i < NUM_THREADS; i++) {
-        ThreadArg *arg = malloc(sizeof(ThreadArg));
-        if(!arg) {
-            perror("malloc ThreadArg");
-            exit(EXIT_FAILURE);
-        }
-        arg->thread_id = i + 1;
-        snprintf(arg->desc, sizeof(arg->desc), "%s", desc);
+    //Extraction audio par FFmpeg en mode VBR
+    execlp("ffmpeg", "ffmpeg", "-i", t->param1, "-q:a", "0", "-map", "a", t->param2, (char *)NULL);
+    perror("execlp ffmpeg");
+    _exit(EXIT_FAILURE);
+}
 
-        if (pthread_create(&threads[i], NULL, thread_work, arg) != 0) {
-            perror("pthread_create");
-            free(arg); 
-            //on ne quitte pas immédiatement pour tenter de joindre ceux créés
-        }
+//Fonction pour mise à jour système
+static void task_update(Task *t) {
+    (void)t;
+    //Executer "sudo apt update && sudo apt upgrade -y"
+    // Sans bloquer sur mdp
+    printf("[Fils %d] Mise à jour système\n", getpid());
+    int code = system("sudo apt update && sudo apt update upgrade -y");
+    if (code != 0) {
+        fprintf(stderr, "Erreur de mise à jour (code %d)\n", code);
+        _exit(EXIT_FAILURE);
     }
+    _exit(EXIT_SUCCESS);
+}
 
-    //Attendre la fin de tous les threads
-    for (int i = 0; i < NUM_THREADS; i++) {
-        pthread_join(threads[i], NULL);
+//Fonction clonage Git
+static void task_clone(Task *t) {
+    //t->param1 = URL, t->param2 = dossier cible
+    printf("[FIls %d] Clonage Git %s -> %s\n", getpid(), t->param1, t->param2);
+    execlp("git", "git", "git", "clone", t->param1, t->param2, (char *)NULL);
+    perror("execlp git");
+    _exit(EXIT_FAILURE);
+}
+
+void execute_task(Task *t) {
+    switch (t->type) {
+        case TASK_COMPRESS:
+            task_compress(t);
+            break;
+        case TASK_CONV_VIDEO:
+            task_convert(t);
+            break;
+        case TASK_UPDATE:
+            task_update(t);
+            break;
+        case TASK_CLONE:
+            task_clone(t);
+            break;
+        default:
+            fprintf(stderr, "[Fils %d] Type de tâche inconnu\n", getpid());
+            _exit(EXIT_FAILURE);
     }
-    printf("[Fils %d] Tous les threads de \"%s\" sont terminés.\n", getpid(), desc);
 }
