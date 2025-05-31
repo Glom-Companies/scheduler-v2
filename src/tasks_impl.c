@@ -5,7 +5,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>    // execlp, getpid, dup2
+#include <unistd.h>    // execlp, getpid, dup2, getuid
 #include <fcntl.h>     // open
 #include <string.h>
 #include <sys/types.h>
@@ -26,26 +26,27 @@ static void redirect_output_to_log(void) {
     close(fd);
 }
 
-// Détecte si un chemin est un fichier (et non un dossier)
+// Détecte si un chemin est un fichier régulier (pas un répertoire)
 static int is_regular_file(const char *path) {
     struct stat st;
     if (stat(path, &st) == -1) return 0;
     return S_ISREG(st.st_mode);
 }
 
-// Retourne 1 si l'extension correspond à un format vidéo
+// Retourne 1 si l'extension correspond à un format vidéo courant
 static int is_video_file(const char *path) {
     const char *ext = strrchr(path, '.');
     if (!ext) return 0;
-    ext++; // sauter le '.'
+    ext++;
     if (strcasecmp(ext, "mp4") == 0) return 1;
     if (strcasecmp(ext, "mkv") == 0) return 1;
     if (strcasecmp(ext, "avi") == 0) return 1;
     if (strcasecmp(ext, "mov") == 0) return 1;
+    if (strcasecmp(ext, "webm") == 0) return 1;
     return 0;
 }
 
-// Retourne 1 si l'extension correspond à un format audio
+// Retourne 1 si l'extension correspond à un format audio courant
 static int is_audio_file(const char *path) {
     const char *ext = strrchr(path, '.');
     if (!ext) return 0;
@@ -54,17 +55,16 @@ static int is_audio_file(const char *path) {
     if (strcasecmp(ext, "wav") == 0) return 1;
     if (strcasecmp(ext, "flac") == 0) return 1;
     if (strcasecmp(ext, "aac") == 0) return 1;
+    if (strcasecmp(ext, "ogg") == 0) return 1;
     return 0;
 }
 
-// Si c'est un fichier audio/vidéo, on retourne le chemin de sortie auto (temporaire)
-// en ajoutant "_compressed" juste avant l'extension. Ex: "video.mp4" -> "video_compressed.mp4"
+// Génère "basename_compressed.ext" pour la sortie ffmpeg
 static char *make_ffmpeg_output(const char *input_path) {
     const char *dot = strrchr(input_path, '.');
     if (!dot) {
-        // Pas d'extension, on ajoute "_compressed"
         size_t len = strlen(input_path);
-        char *out = malloc(len + strlen("_compressed") + 1 + 1);
+        char *out = malloc(len + strlen("_compressed") + 1);
         if (!out) return NULL;
         sprintf(out, "%s_compressed", input_path);
         return out;
@@ -73,7 +73,7 @@ static char *make_ffmpeg_output(const char *input_path) {
     const char *ext = dot + 1;
     size_t ext_len = strlen(ext);
     // Construire "basename_compressed.ext"
-    char *out = malloc(base_len + strlen("_compressed") + 1 + ext_len + 1);
+    char *out = malloc(base_len + strlen("_compressed.") + ext_len + 1);
     if (!out) return NULL;
     memcpy(out, input_path, base_len);
     strcpy(out + base_len, "_compressed.");
@@ -81,70 +81,55 @@ static char *make_ffmpeg_output(const char *input_path) {
     return out;
 }
 
-// ====== Compression Fichier ======
-
+// ====== Compression de fichier ======
 static void task_compress(Task *t) {
     redirect_output_to_log();
     const char *inPath = t->param1;
-    const char *outPath = t->param2; // peut être NULL si on veut auto-générer
-    int ret;
+    const char *outPath = t->param2; // sert uniquement pour zstd
 
-    // Si c'est un fichier audio ou vidéo, on utilise ffmpeg pour réencoder
+    // Cas 1 : si c'est un fichier audio/vidéo → ffmpeg
     if (is_regular_file(inPath) && (is_video_file(inPath) || is_audio_file(inPath))) {
-        // On génère un fichier de sortie si outPath est NULL ou identique à inPath
-        char *ffout = NULL;
-        if (!outPath || strcmp(outPath, inPath) == 0) {
-            ffout = make_ffmpeg_output(inPath);
-            if (!ffout) {
-                fprintf(stderr, "[tasks_impl] Erreur malloc pour ffmpeg output\n");
-                _exit(EXIT_FAILURE);
-            }
-        } else {
-            ffout = strdup(outPath);
-            if (!ffout) {
-                fprintf(stderr, "[tasks_impl] Erreur alloc pour outPath\n");
-                _exit(EXIT_FAILURE);
-            }
+        char *ffout = make_ffmpeg_output(inPath);
+        if (!ffout) {
+            fprintf(stderr, "[tasks_impl] Erreur allocation pour ffmpeg output\n");
+            _exit(EXIT_FAILURE);
         }
 
-        // Choisissez un bon réglage :
-        // - Si c'est vidéo → codec libx264, CRF 23
-        // - Si c'est audio → codec libmp3lame, 192k
         if (is_video_file(inPath)) {
+            // Réencoder la vidéo : CRF à 28 pour réduire significativement la taille
             execlp("ffmpeg", "ffmpeg",
                    "-i", inPath,
-                   "-c:v", "libx264", "-crf", "23", "-preset", "slow",
+                   "-c:v", "libx264", "-crf", "28", "-preset", "medium",
                    "-c:a", "aac", "-b:a", "128k",
                    ffout,
                    (char *)NULL);
-            fprintf(stderr, "[tasks_impl] execlp ffmpeg video failed: %s\n", strerror(errno));
+            fprintf(stderr, "[tasks_impl] execlp ffmpeg (video) failed: %s\n", strerror(errno));
         } else {
-            // Audio
+            // Fichier audio → réencoder en MP3 128k
             execlp("ffmpeg", "ffmpeg",
                    "-i", inPath,
-                   "-c:a", "libmp3lame", "-b:a", "192k",
+                   "-c:a", "libmp3lame", "-b:a", "128k",
                    ffout,
                    (char *)NULL);
-            fprintf(stderr, "[tasks_impl] execlp ffmpeg audio failed: %s\n", strerror(errno));
+            fprintf(stderr, "[tasks_impl] execlp ffmpeg (audio) failed: %s\n", strerror(errno));
         }
         free(ffout);
         _exit(EXIT_FAILURE);
     }
 
-    // Sinon, on retombe sur zstd (compression générique)
-    if (!outPath) {
-        // Générer outPath automatiquement
+    // Cas 2 : autre(s) fichier(s) ou dossier → zstd
+    char *zstd_out = NULL;
+    if (!outPath || strcmp(outPath, inPath) == 0) {
         size_t len = strlen(inPath);
-        char *auto_out = malloc(len + 5); // ".zst" + '\0'
-        if (!auto_out) {
-            fprintf(stderr, "[tasks_impl] Erreur malloc pour zstd output\n");
+        zstd_out = malloc(len + 5);
+        if (!zstd_out) {
+            fprintf(stderr, "[tasks_impl] Erreur allocation pour zstd output\n");
             _exit(EXIT_FAILURE);
         }
-        sprintf(auto_out, "%s.zst", inPath);
-        outPath = auto_out;
+        sprintf(zstd_out, "%s.zst", inPath);
+        outPath = zstd_out;
     }
 
-    // Appel zstd classique
     char threads_opt[16], level_opt[16];
     snprintf(threads_opt, sizeof(threads_opt), "-T%d", 1);
     snprintf(level_opt, sizeof(level_opt), "-%d", 3);
@@ -155,11 +140,11 @@ static void task_compress(Task *t) {
            "-o", outPath,
            (char *)NULL);
     fprintf(stderr, "[tasks_impl] execlp zstd failed: %s\n", strerror(errno));
+    if (zstd_out) free(zstd_out);
     _exit(EXIT_FAILURE);
 }
 
-// ====== Conversion Vidéo → Audio ======
-
+// ====== Conversion vidéo → audio ======
 static void task_convert(Task *t) {
     redirect_output_to_log();
     execlp("ffmpeg", "ffmpeg",
@@ -171,24 +156,39 @@ static void task_convert(Task *t) {
     _exit(EXIT_FAILURE);
 }
 
-// ====== Mise à jour Système ======
-
+// ====== Mise à jour du système ======
 static void task_update(Task *t) {
     (void)t;
     redirect_output_to_log();
-    int code = system("sudo apt update && sudo apt upgrade -y");
-    if (code == -1) {
-        fprintf(stderr, "[tasks_impl] system apt update/upgrade failed: %s\n", strerror(errno));
-        _exit(EXIT_FAILURE);
+
+    if (getuid() == 0) {
+        // Si on est root, on n'utilise pas sudo
+        int code = system("apt update && apt upgrade -y");
+        if (code == -1) {
+            fprintf(stderr, "[tasks_impl] system \"apt update && apt upgrade -y\" failed: %s\n", strerror(errno));
+            _exit(EXIT_FAILURE);
+        }
+        _exit(EXIT_SUCCESS);
     }
-    _exit(EXIT_SUCCESS);
+
+    // Sinon, on tente en mode non interactif,
+    // si l'utilisateur a mis NOPASSWD dans sudoers pour apt
+    {
+        int code = system("sudo -n apt update && sudo -n apt upgrade -y");
+        if (code == -1) {
+            fprintf(stderr, "[tasks_impl] system \"sudo -n apt update && sudo -n apt upgrade -y\" failed: %s\n", strerror(errno));
+            _exit(EXIT_FAILURE);
+        }
+        _exit(EXIT_SUCCESS);
+    }
 }
 
 // ====== Clonage Git ======
-
 static void task_clone(Task *t) {
     redirect_output_to_log();
-    // Correction : on appelle vraiment "git clone", pas seulement "git"
+    // Désactiver prompt SSH (passphrase) :
+    setenv("GIT_TERMINAL_PROMPT", "0", 1);
+
     execlp("git", "git", "clone", t->param1, t->param2, (char *)NULL);
     fprintf(stderr, "[tasks_impl] execlp git clone failed: %s\n", strerror(errno));
     _exit(EXIT_FAILURE);
