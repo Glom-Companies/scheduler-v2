@@ -87,7 +87,7 @@ static void task_compress(Task *t) {
     const char *inPath = t->param1;
     const char *outPath = t->param2; // sert uniquement pour zstd
 
-    // Cas 1 : si c'est un fichier audio/vidéo → ffmpeg
+    // Si c'est un fichier audio/vidéo → ffmpeg
     if (is_regular_file(inPath) && (is_video_file(inPath) || is_audio_file(inPath))) {
         char *ffout = make_ffmpeg_output(inPath);
         if (!ffout) {
@@ -96,11 +96,11 @@ static void task_compress(Task *t) {
         }
 
         if (is_video_file(inPath)) {
-            // Réencoder la vidéo : CRF à 28 pour réduire significativement la taille
+            // Réencoder la vidéo avec CRF=35 et audio à 96k
             execlp("ffmpeg", "ffmpeg",
                    "-i", inPath,
-                   "-c:v", "libx264", "-crf", "28", "-preset", "medium",
-                   "-c:a", "aac", "-b:a", "128k",
+                   "-c:v", "libx264", "-crf", "35", "-preset", "medium",
+                   "-c:a", "aac", "-b:a", "96k",
                    ffout,
                    (char *)NULL);
             fprintf(stderr, "[tasks_impl] execlp ffmpeg (video) failed: %s\n", strerror(errno));
@@ -117,7 +117,7 @@ static void task_compress(Task *t) {
         _exit(EXIT_FAILURE);
     }
 
-    // Cas 2 : autre(s) fichier(s) ou dossier → zstd
+    // Cas générique (autres fichiers ou dossiers) → zstd
     char *zstd_out = NULL;
     if (!outPath || strcmp(outPath, inPath) == 0) {
         size_t len = strlen(inPath);
